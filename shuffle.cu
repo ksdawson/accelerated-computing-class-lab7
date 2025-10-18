@@ -25,6 +25,23 @@ __global__ void no_shuffle_kernel(data_type *src, clock_type *dst) {
 
     // Your code goes here
 
+    // Load into SMEM
+    mem[threadIdx.x] = val;
+    __syncthreads();
+
+    // Compute parallel prefix sum using Hillis Steele Scan
+    uint32_t idx = 1;
+    for (uint32_t step = 0; step < 5; ++step) { // log2(32) = 5
+        // Load prefix from SMEM into register
+        data_type tmp = (threadIdx.x >= idx) ? mem[threadIdx.x - idx] : 0;
+        __syncthreads();
+        // Update prefix in SMEM
+        mem[threadIdx.x] += tmp;
+        // Multiply idx by 2
+        idx <<= 1;
+        __syncthreads();
+    }
+
     end_time = clock_cycle();
     __threadfence();
 
@@ -43,6 +60,17 @@ __global__ void shuffle_kernel(data_type *src, clock_type *dst) {
     start_time = clock_cycle();
 
     // Your code goes here
+
+    // Compute parallel prefix sum using Hillis Steele Scan w/ warp shuffle
+    uint32_t idx = 1;
+    for (uint32_t step = 0; step < 5; ++step) { // log2(32) = 5
+        // Load prefix from register
+        data_type tmp = __shfl_up_sync(0xffffffff, val, idx);
+        // Update prefix in register
+        val += (threadIdx.x >= idx) ? tmp : 0;
+        // Multiply idx by 2
+        idx <<= 1;
+    }
 
     end_time = clock_cycle();
     __threadfence();
