@@ -48,7 +48,125 @@ void scan_cpu(size_t n, typename Op::Data const *x, typename Op::Data *out) {
 
 namespace scan_gpu {
 
-/* TODO: your GPU kernels here... */
+// Generic, aligned struct for vectorized memory access
+template <typename T, int N>
+struct alignas(sizeof(T) * N) Vectorized {
+    T elements[N];
+};
+
+// Helpers
+template <typename Op>
+__device__ typename Op::Data unit_local_scan(typename Op::Data val) {
+    using Data = typename Op::Data;
+    // Computes parallel prefix on 32 elements using Hillis Steele Scan w/ warp shuffle
+    const uint32_t tidx = threadIdx.x % 32;
+    uint32_t idx = 1;
+    for (uint32_t step = 0; step < 5; ++step) { // log2(32) = 5
+        // Load prefix from register
+        Data tmp = __shfl_up_sync(0xffffffff, val, idx);
+        tmp = (tidx >= idx) ? tmp : Op::identity(); // Mask out
+        // Update prefix in register
+        val = Op::combine(val, tmp);
+        // Multiply idx by 2
+        idx <<= 1;
+    }
+    return val;
+}
+
+template <typename Op, uint32_t VEC_SIZE>
+__device__ typename Op::Data warp_local_scan(typename Op::Data *x) {
+    // Data types
+    using Data = typename Op::Data;
+    using VecData = Vectorized<Data, VEC_SIZE>;
+
+    // Vector load from memory
+    const uint32_t tidx = threadIdx.x % 32;
+    VecData valVec = reinterpret_cast<VecData*>(x)[tidx];
+
+    // Compute a local scan for a vector of Data for each thread
+    #pragma unroll
+    for (uint32_t i = 1; i < VEC_SIZE; ++i) {
+        valVec.elements[i] = Op::combine(valVec.elements[i-1], valVec.elements[i]);
+    }
+
+    // Compute a hierarchical scan on the endpoints from each thread scan
+    Data val = valVec.elements[VEC_SIZE - 1];
+    val = unit_local_scan<Op>(val);
+
+    // val for tidx == 31 will be the endpoint for the warp local scan
+    return val;
+}
+
+// Kernel stages: local, hierarchical, local fix
+template <typename Op>
+__global__ void local_scan(size_t n, typename Op::Data *x, void *workspace) {
+    using Data = typename Op::Data;
+
+    // Each SM gets a piece of x
+    size_t sm_n = n / gridDim.x;
+    // Handle tail by giving the rest to the last SM
+    sm_n += (blockIdx.x == gridDim.x - 1) ? n % gridDim.x : 0;
+
+    // Make tmp x
+    Data *tmp_x = reinterpret_cast<Data*>(workspace); // TODO: Switch to SMEM
+
+    // Move buffers
+    x += blockIdx.x * sm_n;
+    tmp_x += blockIdx.x * (sm_n / 128 + sm_n/256);
+
+    // Thread block info
+    const uint32_t num_warps = blockDim.x / 32;
+    const uint32_t warp_idx = threadIdx.x / 32;
+    const uint32_t thread_idx = threadIdx.x % 32;
+
+    // Compute first level
+    for (uint32_t idx = warp_idx; idx < sm_n / 128; idx += num_warps) {
+        // Move buffer
+        Data *wx = x + idx * 128;
+        // Local scan on the warp chunk
+        Data end = warp_local_scan(wx);
+        // If last thread write end back to tmp_x
+        if (thread_idx == 31) {
+            tmp_x[idx] = end;
+        }
+    }
+
+    // Setup buffers
+    std::swap(x, tmp_x);
+
+
+    // Iterate over hierarchy
+    while (sm_n > 0) {
+        // Iterate over blocks of 128 at this level
+        for (uint32_t idx = warp_idx; idx < sm_n / 128; idx += num_warps) {
+            // Move buffer
+            Data *wx = x + idx * 128;
+            // Local scan on the warp chunk
+            Data end = warp_local_scan(wx);
+            // If last thread write end back to tmp_x
+            if (thread_idx == 31) {
+                tmp_x[idx] = end;
+            }
+        }
+
+        // Setup next level
+        sm_n /= 128;
+        std::swap(x, tmp_x);
+
+        // Wait for this level to be done
+        __syncthreads();
+    }
+}
+
+template <typename Op>
+__global__ void hierarchical_scan(size_t n, typename Op::Data *x, void *workspace) {
+    using Data = typename Op::Data;
+}
+
+template <typename Op>
+__global__ void local_scan_fix(size_t n, typename Op::Data *x, void *workspace) {
+    using Data = typename Op::Data;
+}
 
 // Returns desired size of scratch buffer in bytes.
 template <typename Op> size_t get_workspace_size(size_t n) {
@@ -99,8 +217,22 @@ typename Op::Data *launch_scan(
     void *workspace       // pointer to GPU memory
 ) {
     using Data = typename Op::Data;
-    /* TODO: your CPU code here... */
-    return nullptr; // replace with an appropriate pointer
+    
+    // Kernel returns nothing
+    gpu_scan<Op><<<1, 32>>>(n, x, workspace);
+
+    // Approach: launch two kernels
+    // First:
+    // (1) Divide x across the 48 SMs
+    // (2) Each SM computes the partial prefix across x/48
+    // Intermediate:
+    // (1) In the CPU code do the hierarchical scan of the 48 endpoints
+    // Second:
+    // (1) Seed each SM with the value from the hierarchical scan and recompute
+
+    // Stages: (1) Local scan (GPU) (2) Hierarchical scan (CPU) (3) Local scan fix-up (GPU)
+
+    return nullptr;
 }
 
 } // namespace scan_gpu
