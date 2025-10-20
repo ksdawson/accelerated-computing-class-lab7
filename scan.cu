@@ -46,6 +46,14 @@ void scan_cpu(size_t n, typename Op::Data const *x, typename Op::Data *out) {
 ////////////////////////////////////////////////////////////////////////////////
 // Optimized GPU Implementation
 
+/// Helpers to deal with Op::Data type
+
+// Generic, aligned struct for vectorized memory access
+template <typename T, int N>
+struct alignas(sizeof(T) * N) Vectorized {
+    T elements[N];
+};
+
 // Needed because compiler doesn't know how to shuffle DebugRange
 template <typename T>
 __device__ T shfl_up_any(T val, unsigned int delta) {
@@ -66,12 +74,6 @@ __device__ T shfl_up_any(T val, unsigned int delta) {
 }
 
 namespace scan_gpu {
-
-// Generic, aligned struct for vectorized memory access
-// template <typename T, int N>
-// struct alignas(sizeof(T) * N) Vectorized {
-//     T elements[N];
-// };
 
 // Helpers
 // template <typename Op, uint32_t VEC_SIZE>
@@ -244,20 +246,32 @@ __global__ void scan_gpu_single_thread(size_t n, typename Op::Data const *x, typ
         out[i] = accumulator;
     }
 }
-template <typename Op>
+template <typename Op, uint32_t VEC_SIZE>
 __global__ void scan_gpu_single_warp(size_t n, typename Op::Data const *x, typename Op::Data *out) {
+    // Data types
     using Data = typename Op::Data;
+    using VecData = Vectorized<Data, VEC_SIZE>;
 
     // Work for each thread
     const uint32_t thread_idx = threadIdx.x % 32;
     const uint32_t n_per_thread = n / 32;
     const uint32_t start_i = threadIdx.x * n_per_thread;
     const uint32_t end_i = (threadIdx.x + 1) * n_per_thread;
+    const uint32_t start_vi = start_i / VEC_SIZE;
+    const uint32_t end_vi = end_i / VEC_SIZE;
+
+    // Vectorize
+    VecData const *vx = reinterpret_cast<VecData const *>(x);
+    VecData *vout = reinterpret_cast<VecData*>(out);
 
     // Local scan
     Data accumulator = Op::identity();
-    for (uint32_t i = start_i; i < end_i; ++i) {
-        accumulator = Op::combine(accumulator, x[i]);
+    for (uint32_t i = start_vi; i < end_vi; ++i) {
+        VecData v = vx[i];
+        #pragma unroll
+        for (uint32_t vi = 0; vi < VEC_SIZE; ++vi) {
+            accumulator = Op::combine(accumulator, v.elements[vi]);
+        }
     }
     __syncwarp();
 
@@ -269,10 +283,15 @@ __global__ void scan_gpu_single_warp(size_t n, typename Op::Data const *x, typen
     accumulator = (thread_idx >= 1) ? accumulator : Op::identity();
 
     // Local scan fix
-    for (uint32_t i = start_i; i < end_i; ++i) {
-        accumulator = Op::combine(accumulator, x[i]);
+    for (uint32_t i = start_vi; i < end_vi; ++i) {
+        VecData v = vx[i];
+        #pragma unroll
+        for (uint32_t vi = 0; vi < VEC_SIZE; ++vi) {
+            accumulator = Op::combine(accumulator, v.elements[vi]);
+            v.elements[vi] = accumulator;
+        }
         // Output to memory
-        out[i] = accumulator;
+        vout[i] = v;
     }
 
     // Handle tail
@@ -334,13 +353,13 @@ typename Op::Data *launch_scan(
 ) {
     using Data = typename Op::Data;
 
-    if (n <= 1024) {
-        // For small sizes do sequentially
-        // scan_gpu_single_thread<Op><<<1, 1>>>(n, x, x);
-        scan_gpu_single_warp<Op><<<1, 32>>>(n, x, x);
+    if (sizeof(Data) == 4) {
+        scan_gpu_single_warp<Op, 4><<<1, 32>>>(n, x, x);
+        return x;
+    } else if (sizeof(Data) == 8) {
+        scan_gpu_single_warp<Op, 2><<<1, 32>>>(n, x, x);
         return x;
     } else {
-        // TODO: For larger sizes do in parallel on the GPU
         return nullptr;
     }
 }
