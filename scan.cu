@@ -76,20 +76,6 @@ __device__ T shfl_up_any(T val, unsigned int delta) {
 namespace scan_gpu {
 
 // Helpers
-// template <typename Op, uint32_t VEC_SIZE>
-// __device__ void thread_local_scan(void *val, typename Op::Data seed) {
-//     // Vectorize pointer
-//     using VecData = Vectorized<Data, VEC_SIZE>;
-//     VecData valVec = reinterpret_cast<VecData*>(val);
-
-//     // Compute a local scan for a vector of Data for each thread
-//     valVec.elements[0] = Op::combine(seed, valVec.elements[0]);
-//     #pragma unroll
-//     for (uint32_t i = 1; i < VEC_SIZE; ++i) {
-//         valVec.elements[i] = Op::combine(valVec.elements[i-1], valVec.elements[i]);
-//     }
-// }
-
 template <typename Op>
 __device__ typename Op::Data warp_local_scan(typename Op::Data val) {
     using Data = typename Op::Data;
@@ -112,130 +98,6 @@ __device__ typename Op::Data warp_local_scan(typename Op::Data val) {
     return val;
 }
 
-// __device__ void sm_scan() {
-//     // New approach for intra-block
-//     // (1) Load block from GMEM to SMEM
-//     // (2) Each thread gets a contiguous block from SMEM
-//     // (3) Warp shuffle endpoints
-// }
-
-// template <typename Op, uint32_t VEC_SIZE, bool FIX>
-// __device__ void sm_scan(size_t n, typename Op::Data *in, typename Op::Data *out) {
-//     // Data types
-//     using Data = typename Op::Data;
-//     using VecData = Vectorized<Data, VEC_SIZE>;
-
-//     // Thread block info
-//     const uint32_t num_warps = blockDim.x / 32;
-//     const uint32_t warp_idx = threadIdx.x / 32;
-//     const uint32_t thread_idx = threadIdx.x % 32;
-
-//     //
-//     constexpr uint32_t warp_block_size = 32 * VEC_SIZE;
-//     constexpr uint32_t out_n = n / warp_block_size;
-
-//     // First pass local scan to get the endpoint for each warp w/ no seed
-//     for (uint32_t idx = warp_idx; idx < out_n; idx += num_warps) {
-//         // Move buffer
-//         Data *win = in + idx * warp_block_size;
-
-//         // Vector load from memory
-//         VecData valVec = reinterpret_cast<VecData*>(win)[thread_idx];
-
-//         // Compute a local scan for a vector of Data for each thread
-//         thread_local_scan((void *)&valVec, Op::identity());
-
-//         // Compute a hierarchical scan on the endpoints from each thread scan
-//         Data end = valVec.elements[VEC_SIZE - 1];
-//         Data end_fixed = warp_local_scan<Op>(end);
-
-//         // Write only the last to memory
-//         if (thead_idx == 31) {
-//             out[idx] = end_fixed;
-//         }
-//     }
-
-//     // Hierarchical scan on the endpoints for each warp
-//     Data *new_out = out + out_n;
-//     sm_scan(n / warp_block_size, out, new_out);
-
-//     // Second pass local scan fix to get all points w/ a seed
-//     if constexpr (FIX) {
-        
-//     }
-// }
-
-// // Kernel stages: local, hierarchical, local fix
-// template <typename Op>
-// __global__ void local_scan(size_t n, typename Op::Data *x, void *workspace) {
-//     using Data = typename Op::Data;
-
-//     // Each SM gets a piece of x
-//     size_t sm_n = n / gridDim.x;
-//     // Handle tail by giving the rest to the last SM
-//     sm_n += (blockIdx.x == gridDim.x - 1) ? n % gridDim.x : 0;
-
-//     // Make tmp x
-//     Data *tmp_x = reinterpret_cast<Data*>(workspace); // TODO: Switch to SMEM
-
-//     // Move buffers
-//     x += blockIdx.x * sm_n;
-//     tmp_x += blockIdx.x * (sm_n / 128 + sm_n/256);
-
-//     // Thread block info
-//     const uint32_t num_warps = blockDim.x / 32;
-//     const uint32_t warp_idx = threadIdx.x / 32;
-//     const uint32_t thread_idx = threadIdx.x % 32;
-
-//     // Compute first level
-//     for (uint32_t idx = warp_idx; idx < sm_n / 128; idx += num_warps) {
-//         // Move buffer
-//         Data *wx = x + idx * 128;
-//         // Local scan on the warp chunk
-//         Data end = warp_local_scan(wx);
-//         // If last thread write end back to tmp_x
-//         if (thread_idx == 31) {
-//             tmp_x[idx] = end;
-//         }
-//     }
-
-//     // Setup buffers
-//     std::swap(x, tmp_x);
-
-
-//     // Iterate over hierarchy
-//     while (sm_n > 0) {
-//         // Iterate over blocks of 128 at this level
-//         for (uint32_t idx = warp_idx; idx < sm_n / 128; idx += num_warps) {
-//             // Move buffer
-//             Data *wx = x + idx * 128;
-//             // Local scan on the warp chunk
-//             Data end = warp_local_scan(wx);
-//             // If last thread write end back to tmp_x
-//             if (thread_idx == 31) {
-//                 tmp_x[idx] = end;
-//             }
-//         }
-
-//         // Setup next level
-//         sm_n /= 128;
-//         std::swap(x, tmp_x);
-
-//         // Wait for this level to be done
-//         __syncthreads();
-//     }
-// }
-
-// template <typename Op>
-// __global__ void hierarchical_scan(size_t n, typename Op::Data *x, void *workspace) {
-//     using Data = typename Op::Data;
-// }
-
-// template <typename Op>
-// __global__ void local_scan_fix(size_t n, typename Op::Data *x, void *workspace) {
-//     using Data = typename Op::Data;
-// }
-
 // Sequential Kernels
 template <typename Op>
 __global__ void scan_gpu_single_thread(size_t n, typename Op::Data const *x, typename Op::Data *out) {
@@ -246,13 +108,18 @@ __global__ void scan_gpu_single_thread(size_t n, typename Op::Data const *x, typ
         out[i] = accumulator;
     }
 }
-template <typename Op, uint32_t VEC_SIZE>
-__global__ void scan_gpu_single_warp(size_t n, typename Op::Data const *x, typename Op::Data *out) {
+
+//
+template <typename Op, uint32_t VEC_SIZE, bool DO_FIX>
+__device__ void warp_scan(
+    size_t n, typename Op::Data const *x, typename Op::Data *out, // Work dimensions
+    typename Op::Data seed // Seed for thread 0
+) {
     // Data types
     using Data = typename Op::Data;
     using VecData = Vectorized<Data, VEC_SIZE>;
 
-    // Work for each thread
+    // Divide x across the threads
     const uint32_t thread_idx = threadIdx.x % 32;
     const uint32_t n_per_thread = n / 32;
     const uint32_t start_i = threadIdx.x * n_per_thread;
@@ -265,7 +132,7 @@ __global__ void scan_gpu_single_warp(size_t n, typename Op::Data const *x, typen
     VecData *vout = reinterpret_cast<VecData*>(out);
 
     // Local scan
-    Data accumulator = Op::identity();
+    Data accumulator = (thread_idx == 0) ? seed : Op::identity();
     for (uint32_t i = start_vi; i < end_vi; ++i) {
         VecData v = vx[i];
         #pragma unroll
@@ -278,36 +145,76 @@ __global__ void scan_gpu_single_warp(size_t n, typename Op::Data const *x, typen
     // Hierarchical scan on endpoints
     accumulator = warp_local_scan<Op>(accumulator);
 
-    // Shuffle accumulators
-    accumulator = shfl_up_any(accumulator, 1);
-    accumulator = (thread_idx >= 1) ? accumulator : Op::identity();
+    if constexpr (DO_FIX) {
+        // Shuffle accumulators
+        accumulator = shfl_up_any(accumulator, 1);
+        accumulator = (thread_idx >= 1) ? accumulator : Op::identity();
 
-    // Local scan fix
-    for (uint32_t i = start_vi; i < end_vi; ++i) {
-        VecData v = vx[i];
-        #pragma unroll
-        for (uint32_t vi = 0; vi < VEC_SIZE; ++vi) {
-            accumulator = Op::combine(accumulator, v.elements[vi]);
-            v.elements[vi] = accumulator;
+        // Local scan fix
+        for (uint32_t i = start_vi; i < end_vi; ++i) {
+            VecData v = vx[i];
+            #pragma unroll
+            for (uint32_t vi = 0; vi < VEC_SIZE; ++vi) {
+                accumulator = Op::combine(accumulator, v.elements[vi]);
+                v.elements[vi] = accumulator;
+            }
+            // Output to memory
+            vout[i] = v;
         }
-        // Output to memory
-        vout[i] = v;
-    }
 
-    // Handle tail
-    if (thread_idx == 31) {
-        for (uint32_t i = end_i; i < end_i + n % 32; ++i) {
-            accumulator = Op::combine(accumulator, x[i]);
-            out[i] = accumulator;
+        // Handle tail
+        if (thread_idx == 31) {
+            for (uint32_t i = end_i; i < end_i + n % 32; ++i) {
+                accumulator = Op::combine(accumulator, x[i]);
+                out[i] = accumulator;
+            }
+        }
+    } else constexpr {
+        // Only output last accumulator to memory
+        if (thread_idx == 31) {
+            *out = accumulator;
         }
     }
+}
+
+// 3-Kernel Parallel Algorithm
+template <typename Op, uint32_t VEC_SIZE, bool DO_FIX>
+__global__ void local_scan(size_t n, typename Op::Data const *x, typename Op::Data *out, typename Op::Data *seed) {
+    // Thread block info
+    const uint32_t num_sm = gridDim.x;
+    const uint32_t num_warp = blockDim.x / 32;
+    const uint32_t block_idx = blockIdx.x;
+    const uint32_t warp_idx = threadIdx.x / 32;
+    const uint32_t thread_idx = threadIdx.x % 32;
+
+    // Divide x across the SMs
+    const uint32_t n_per_sm = n / num_sm;
+    Data const *sm_x = x + block_idx * n_per_sm;
+    Data *sm_out = out + block_idx * n_per_sm;
+    Data *sm_seed = seed + block_idx * num_warp;
+
+    // Divide sm_x across the warps
+    const uint32_t n_per_warp = n_per_sm / num_warp;
+    Data const *warp_x = sm_x + warp_idx * n_per_warp;
+    Data *warp_out = sm_out + warp_idx * n_per_warp;
+    Data *warp_seed = sm_seed + warp_idx;
+
+    // Call warp scan
+    if constexpr (DO_FIX) {
+        warp_scan<Op, VEC_SIZE, true>(n_per_warp, warp_x, warp_out, *warp_seed);
+    } else constexpr {
+        warp_scan<Op, VEC_SIZE, false>(n_per_warp, warp_x, warp_seed, Op::identity());
+    }
+}
+template <typename Op, uint32_t VEC_SIZE>
+__global__ void hierarchical_scan(size_t n, typename Op::Data const *x, typename Op::Data *out) {
+    warp_scan<Op, VEC_SIZE, true>(n, x, out);
 }
 
 // Returns desired size of scratch buffer in bytes.
 template <typename Op> size_t get_workspace_size(size_t n) {
     using Data = typename Op::Data;
-    /* TODO: your CPU code here... */
-    return 0;
+    return 1 * 1 * sizeof(Data); // num sms x num warps
 }
 
 // 'launch_scan'
@@ -353,11 +260,17 @@ typename Op::Data *launch_scan(
 ) {
     using Data = typename Op::Data;
 
+    Data *seed = reinterpret_cast<Data*>(workspace);
+
     if (sizeof(Data) == 4) {
-        scan_gpu_single_warp<Op, 4><<<1, 32>>>(n, x, x);
+        local_scan<Op, 4, false><<<1, 32>>>(n, x, x, seed);
+        hierarchical_scan<Op, 4><<<1, 32>>>(1*1, seed, seed);
+        local_scan<Op, 4, false><<<1, 32>>>(n, x, x, seed);
         return x;
     } else if (sizeof(Data) == 8) {
-        scan_gpu_single_warp<Op, 2><<<1, 32>>>(n, x, x);
+        local_scan<Op, 2, false><<<1, 32>>>(n, x, x, seed);
+        hierarchical_scan<Op, 2><<<1, 32>>>(1*1, seed, seed);
+        local_scan<Op, 2, false><<<1, 32>>>(n, x, x, seed);
         return x;
     } else {
         return nullptr;
