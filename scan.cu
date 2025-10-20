@@ -169,7 +169,7 @@ __device__ void warp_scan(
                 out[i] = accumulator;
             }
         }
-    } else constexpr {
+    } else {
         // Only output last accumulator to memory
         if (thread_idx == 31) {
             *out = accumulator;
@@ -180,12 +180,12 @@ __device__ void warp_scan(
 // 3-Kernel Parallel Algorithm
 template <typename Op, uint32_t VEC_SIZE, bool DO_FIX>
 __global__ void local_scan(size_t n, typename Op::Data const *x, typename Op::Data *out, typename Op::Data *seed) {
+    using Data = typename Op::Data;
     // Thread block info
     const uint32_t num_sm = gridDim.x;
     const uint32_t num_warp = blockDim.x / 32;
     const uint32_t block_idx = blockIdx.x;
     const uint32_t warp_idx = threadIdx.x / 32;
-    const uint32_t thread_idx = threadIdx.x % 32;
 
     // Divide x across the SMs
     const uint32_t n_per_sm = n / num_sm;
@@ -199,16 +199,19 @@ __global__ void local_scan(size_t n, typename Op::Data const *x, typename Op::Da
     Data *warp_out = sm_out + warp_idx * n_per_warp;
     Data *warp_seed = sm_seed + warp_idx;
 
+    // Each chunk gets the previous seed
+    *warp_seed = (block_idx == 0 && warp_idx == 0) ? Op::identity() : *(warp_seed - 1);
+
     // Call warp scan
     if constexpr (DO_FIX) {
         warp_scan<Op, VEC_SIZE, true>(n_per_warp, warp_x, warp_out, *warp_seed);
-    } else constexpr {
+    } else {
         warp_scan<Op, VEC_SIZE, false>(n_per_warp, warp_x, warp_seed, Op::identity());
     }
 }
 template <typename Op, uint32_t VEC_SIZE>
 __global__ void hierarchical_scan(size_t n, typename Op::Data const *x, typename Op::Data *out) {
-    warp_scan<Op, VEC_SIZE, true>(n, x, out);
+    warp_scan<Op, VEC_SIZE, true>(n, x, out, Op::identity());
 }
 
 // Returns desired size of scratch buffer in bytes.
@@ -260,17 +263,23 @@ typename Op::Data *launch_scan(
 ) {
     using Data = typename Op::Data;
 
+    // Use the workspace as scratch for seeds
     Data *seed = reinterpret_cast<Data*>(workspace);
 
+    // Thread block dimensions
+    constexpr uint32_t B = 1;
+    constexpr uint32_t W = 1;
+    constexpr uint32_t T = 32;
+
     if (sizeof(Data) == 4) {
-        local_scan<Op, 4, false><<<1, 32>>>(n, x, x, seed);
-        hierarchical_scan<Op, 4><<<1, 32>>>(1*1, seed, seed);
-        local_scan<Op, 4, false><<<1, 32>>>(n, x, x, seed);
+        local_scan<Op, 4, false><<<B, W*T>>>(n, x, x, seed);
+        hierarchical_scan<Op, 4><<<1, T>>>(B*W, seed, seed); // Use only 1 SM and 1 warp for the small hierarchical scan
+        local_scan<Op, 4, true><<<B, W*T>>>(n, x, x, seed);
         return x;
     } else if (sizeof(Data) == 8) {
-        local_scan<Op, 2, false><<<1, 32>>>(n, x, x, seed);
-        hierarchical_scan<Op, 2><<<1, 32>>>(1*1, seed, seed);
-        local_scan<Op, 2, false><<<1, 32>>>(n, x, x, seed);
+        local_scan<Op, 2, false><<<B, W*T>>>(n, x, x, seed);
+        hierarchical_scan<Op, 2><<<1, T>>>(B*W, seed, seed);
+        local_scan<Op, 2, true><<<B, W*T>>>(n, x, x, seed);
         return x;
     } else {
         return nullptr;
