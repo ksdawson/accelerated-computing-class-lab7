@@ -73,37 +73,29 @@ __device__ T shfl_up_any(T val, unsigned int delta) {
 }
 
 // Memory loading helpers
+template <typename Op, uint32_t VEC_SIZE>
 __device__ void load_buffer(
-    const float *src, const uint32_t src_width,
-    float *dst, const uint32_t dst_width,
+    typename Op::Data const *src, typename Op::Data *dst,
     const uint32_t num_items
 ) {
-    const float4 *src4 = reinterpret_cast<const float4*>(src);
-    float4 *dst4 = reinterpret_cast<float4*>(dst);
-    const uint32_t src_vec_width = src_width / 4;
-    const uint32_t dst_vec_width = dst_width / 4;
-    for (uint32_t idx = threadIdx.x; idx < num_items / 4; idx += blockDim.x) {
-        // Compute 2D index in terms of float4s
-        const uint32_t i = idx / dst_vec_width;
-        const uint32_t j = idx % dst_vec_width;
-        // Vectorized load and store
-        float4 val = src4[i * src_vec_width + j];
-        dst4[i * dst_vec_width + j] = val;
+    using Data = typename Op::Data;
+    using VecData = Vectorized<Data, VEC_SIZE>;
+    VecData const *vsrc = reinterpret_cast<VecData const *>(src);
+    VecData *vdst = reinterpret_cast<VecData*>(dst);
+    for (uint32_t idx = threadIdx.x; idx < num_items / VEC_SIZE; idx += blockDim.x) {
+        vdst[idx] = vsrc[idx];
     }
     __syncthreads();
 }
+template <typename Op, uint32_t VEC_SIZE>
 __device__ void load_buffer_async(
-    float const *src, const uint32_t src_width, 
-    float *dst, const uint32_t dst_width,
+    typename Op::Data const *src, typename Op::Data *dst,
     const uint32_t num_items
 ) {
-    for (uint32_t idx = threadIdx.x; idx < num_items / 4; idx += blockDim.x) {
-        // Get index to copy
-        const uint32_t flat_idx = idx * 4;
-        const uint32_t i = flat_idx / dst_width;
-        const uint32_t j = flat_idx % dst_width;
-        // Copy mem over
-        __pipeline_memcpy_async(&dst[i * dst_width + j], &src[i * src_width + j], sizeof(float4), 0);
+    using Data = typename Op::Data;
+    for (uint32_t idx = threadIdx.x; idx < num_items / VEC_SIZE; idx += blockDim.x) {
+        const uint32_t flat_idx = idx * VEC_SIZE;
+        __pipeline_memcpy_async(&dst[flat_idx], &src[flat_idx], sizeof(Data), 0);
     }
     __pipeline_commit();
 }
