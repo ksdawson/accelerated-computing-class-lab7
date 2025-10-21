@@ -224,7 +224,7 @@ __global__ void hierarchical_scan(size_t n, typename Op::Data const *x, typename
 // Returns desired size of scratch buffer in bytes.
 template <typename Op> size_t get_workspace_size(size_t n) {
     using Data = typename Op::Data;
-    return 1 * 16 * sizeof(Data); // num sms x num warps
+    return 48 * 8 * sizeof(Data); // num sms x num warps
 }
 
 // 'launch_scan'
@@ -274,8 +274,8 @@ typename Op::Data *launch_scan(
     Data *seed = reinterpret_cast<Data*>(workspace);
 
     // Thread block dimensions
-    constexpr uint32_t B = 1;
-    constexpr uint32_t W = 16;
+    constexpr uint32_t B = 48;
+    constexpr uint32_t W = 8;
     constexpr uint32_t T = 32;
 
     if (sizeof(Data) == 4) {
@@ -539,10 +539,10 @@ int main(int argc, char const *const *argv) {
         100,
         1024,
         1000,
-        // 1 << 20,
-        // 1'000'000,
-        // 16 << 20,
-        // 64 << 20,
+        1 << 20,
+        1'000'000,
+        16 << 20,
+        64 << 20,
     };
 
     auto rng = std::mt19937(0xCA7CAFE);
