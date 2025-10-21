@@ -2,6 +2,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cuda_runtime.h>
+#include <cuda_pipeline_primitives.h>
 #include <iostream>
 #include <random>
 #include <vector>
@@ -47,13 +48,11 @@ void scan_cpu(size_t n, typename Op::Data const *x, typename Op::Data *out) {
 // Optimized GPU Implementation
 
 /// Helpers to deal with Op::Data type
-
 // Generic, aligned struct for vectorized memory access
 template <typename T, int N>
 struct alignas(sizeof(T) * N) Vectorized {
     T elements[N];
 };
-
 // Needed because compiler doesn't know how to shuffle DebugRange
 template <typename T>
 __device__ T shfl_up_any(T val, unsigned int delta) {
@@ -71,6 +70,42 @@ __device__ T shfl_up_any(T val, unsigned int delta) {
         dst[1] = __shfl_up_sync(0xffffffff, src[1], delta);
     }
     return result;
+}
+
+// Memory loading helpers
+__device__ void load_buffer(
+    const float *src, const uint32_t src_width,
+    float *dst, const uint32_t dst_width,
+    const uint32_t num_items
+) {
+    const float4 *src4 = reinterpret_cast<const float4*>(src);
+    float4 *dst4 = reinterpret_cast<float4*>(dst);
+    const uint32_t src_vec_width = src_width / 4;
+    const uint32_t dst_vec_width = dst_width / 4;
+    for (uint32_t idx = threadIdx.x; idx < num_items / 4; idx += blockDim.x) {
+        // Compute 2D index in terms of float4s
+        const uint32_t i = idx / dst_vec_width;
+        const uint32_t j = idx % dst_vec_width;
+        // Vectorized load and store
+        float4 val = src4[i * src_vec_width + j];
+        dst4[i * dst_vec_width + j] = val;
+    }
+    __syncthreads();
+}
+__device__ void load_buffer_async(
+    float const *src, const uint32_t src_width, 
+    float *dst, const uint32_t dst_width,
+    const uint32_t num_items
+) {
+    for (uint32_t idx = threadIdx.x; idx < num_items / 4; idx += blockDim.x) {
+        // Get index to copy
+        const uint32_t flat_idx = idx * 4;
+        const uint32_t i = flat_idx / dst_width;
+        const uint32_t j = flat_idx % dst_width;
+        // Copy mem over
+        __pipeline_memcpy_async(&dst[i * dst_width + j], &src[i * src_width + j], sizeof(float4), 0);
+    }
+    __pipeline_commit();
 }
 
 namespace scan_gpu {
@@ -275,22 +310,41 @@ typename Op::Data *launch_scan(
 
     // Thread block dimensions
     constexpr uint32_t B = 48;
-    constexpr uint32_t W = 8;
+    constexpr uint32_t W = 8; // Tuning parameter
     constexpr uint32_t T = 32;
 
-    if (sizeof(Data) == 4) {
-        local_scan<Op, 4, false><<<B, W*T>>>(n, x, x, seed);
-        hierarchical_scan<Op, 4><<<1, T>>>(B*W, seed, seed); // Use only 1 SM and 1 warp for the small hierarchical scan
-        local_scan<Op, 4, true><<<B, W*T>>>(n, x, x, seed);
-        return x;
-    } else if (sizeof(Data) == 8) {
-        local_scan<Op, 2, false><<<B, W*T>>>(n, x, x, seed);
-        hierarchical_scan<Op, 2><<<1, T>>>(B*W, seed, seed);
-        local_scan<Op, 2, true><<<B, W*T>>>(n, x, x, seed);
-        return x;
-    } else {
+    // Set vector size
+    if constexpr (sizeof(Data) > 16) {
         return nullptr;
     }
+    constexpr uint32_t VS = 16 / sizeof(Data);
+
+    // Memory
+    // ? * W * 2 * sizeof(Data); // Double buffer
+
+    // 3-Kernel parallel algorithm
+    // cudaFuncSetAttribute(
+    //     local_scan<Op, VS, false>,
+    //     cudaFuncAttributeMaxDynamicSharedMemorySize,
+    //     ?
+    // );
+    local_scan<Op, VS, false><<<B, W*T>>>(n, x, x, seed);
+
+    // cudaFuncSetAttribute(
+    //     hierarchical_scan<Op, VS>,
+    //     cudaFuncAttributeMaxDynamicSharedMemorySize,
+    //     ?
+    // );
+    hierarchical_scan<Op, VS><<<1, T>>>(B*W, seed, seed); // Use only 1 SM and 1 warp for the small hierarchical scan
+
+    // cudaFuncSetAttribute(
+    //     local_scan<Op, VS, true>,
+    //     cudaFuncAttributeMaxDynamicSharedMemorySize,
+    //     ?
+    // );
+    local_scan<Op, VS, true><<<B, W*T>>>(n, x, x, seed);
+
+    return x;
 }
 
 } // namespace scan_gpu
