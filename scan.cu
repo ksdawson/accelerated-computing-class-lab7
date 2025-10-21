@@ -98,18 +98,6 @@ __device__ typename Op::Data warp_local_scan(typename Op::Data val) {
     return val;
 }
 
-// Sequential Kernels
-template <typename Op>
-__global__ void scan_gpu_single_thread(size_t n, typename Op::Data const *x, typename Op::Data *out) {
-    using Data = typename Op::Data;
-    Data accumulator = Op::identity();
-    for (size_t i = 0; i < n; i++) {
-        accumulator = Op::combine(accumulator, x[i]);
-        out[i] = accumulator;
-    }
-}
-
-//
 template <typename Op, uint32_t VEC_SIZE, bool DO_FIX>
 __device__ void warp_scan(
     size_t n, typename Op::Data const *x, typename Op::Data *out, // Work dimensions
@@ -121,9 +109,9 @@ __device__ void warp_scan(
 
     // Divide x across the threads
     const uint32_t thread_idx = threadIdx.x % 32;
-    const uint32_t n_per_thread = n / 32;
-    const uint32_t start_i = threadIdx.x * n_per_thread;
-    const uint32_t end_i = (threadIdx.x + 1) * n_per_thread;
+    const uint32_t n_per_thread = n / 32 + ((thread_idx < n % 32) ? 1 : 0);
+    const uint32_t start_i = thread_idx * n_per_thread;
+    const uint32_t end_i = (thread_idx + 1) * n_per_thread;
     const uint32_t start_vi = start_i / VEC_SIZE;
     const uint32_t end_vi = end_i / VEC_SIZE;
 
@@ -163,12 +151,12 @@ __device__ void warp_scan(
         }
 
         // Handle tail
-        if (thread_idx == 31) {
-            for (uint32_t i = end_i; i < end_i + n % 32; ++i) {
-                accumulator = Op::combine(accumulator, x[i]);
-                out[i] = accumulator;
-            }
-        }
+        // if (thread_idx == 31) {
+        //     for (uint32_t i = end_i; i < end_i + n % 32; ++i) {
+        //         accumulator = Op::combine(accumulator, x[i]);
+        //         out[i] = accumulator;
+        //     }
+        // }
     } else {
         // Only output last accumulator to memory
         if (thread_idx == 31) {
@@ -188,23 +176,22 @@ __global__ void local_scan(size_t n, typename Op::Data const *x, typename Op::Da
     const uint32_t warp_idx = threadIdx.x / 32;
 
     // Divide x across the SMs
-    const uint32_t n_per_sm = n / num_sm;
+    const uint32_t n_per_sm = n / num_sm + ((block_idx < n % num_sm) ? 1 : 0);
     Data const *sm_x = x + block_idx * n_per_sm;
     Data *sm_out = out + block_idx * n_per_sm;
     Data *sm_seed = seed + block_idx * num_warp;
 
     // Divide sm_x across the warps
-    const uint32_t n_per_warp = n_per_sm / num_warp;
+    const uint32_t n_per_warp = n_per_sm / num_warp + ((warp_idx < n_per_sm % num_warp) ? 1 : 0);
     Data const *warp_x = sm_x + warp_idx * n_per_warp;
     Data *warp_out = sm_out + warp_idx * n_per_warp;
     Data *warp_seed = sm_seed + warp_idx;
 
-    // Each chunk gets the previous seed
-    *warp_seed = (block_idx == 0 && warp_idx == 0) ? Op::identity() : *(warp_seed - 1);
-
     // Call warp scan
     if constexpr (DO_FIX) {
-        warp_scan<Op, VEC_SIZE, true>(n_per_warp, warp_x, warp_out, *warp_seed);
+        // Each chunk gets the previous seed
+        Data seed_val = (block_idx == 0 && warp_idx == 0) ? Op::identity() : *(warp_seed - 1);
+        warp_scan<Op, VEC_SIZE, true>(n_per_warp, warp_x, warp_out, seed_val);
     } else {
         warp_scan<Op, VEC_SIZE, false>(n_per_warp, warp_x, warp_seed, Op::identity());
     }
@@ -217,7 +204,7 @@ __global__ void hierarchical_scan(size_t n, typename Op::Data const *x, typename
 // Returns desired size of scratch buffer in bytes.
 template <typename Op> size_t get_workspace_size(size_t n) {
     using Data = typename Op::Data;
-    return 1 * 1 * sizeof(Data); // num sms x num warps
+    return 1 * 2 * sizeof(Data); // num sms x num warps
 }
 
 // 'launch_scan'
@@ -268,7 +255,7 @@ typename Op::Data *launch_scan(
 
     // Thread block dimensions
     constexpr uint32_t B = 1;
-    constexpr uint32_t W = 1;
+    constexpr uint32_t W = 2;
     constexpr uint32_t T = 32;
 
     if (sizeof(Data) == 4) {
