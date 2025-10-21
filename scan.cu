@@ -71,6 +71,23 @@ __device__ T shfl_up_any(T val, unsigned int delta) {
     }
     return result;
 }
+template <typename T>
+__device__ T shfl_down_any(T val, unsigned int delta) {
+    T result;
+    if constexpr (sizeof(T) == 4) {
+        // Single 32-bit value
+        uint32_t v = *reinterpret_cast<uint32_t*>(&val);
+        v = __shfl_down_sync(0xffffffff, v, delta);
+        *reinterpret_cast<uint32_t*>(&result) = v;
+    } else {
+        // Two 32-bit values (e.g. DebugRange)
+        const uint32_t* src = reinterpret_cast<const uint32_t*>(&val);
+        uint32_t* dst = reinterpret_cast<uint32_t*>(&result);
+        dst[0] = __shfl_down_sync(0xffffffff, src[0], delta);
+        dst[1] = __shfl_down_sync(0xffffffff, src[1], delta);
+    }
+    return result;
+}
 
 namespace scan_gpu {
 
@@ -132,7 +149,7 @@ __device__ inline typename Op::Data thread_local_scan(size_t n, typename Op::Dat
 }
 
 template <typename Op, uint32_t VEC_SIZE, bool DO_FIX>
-__device__ void warp_scan(
+__device__ typename Op::Data warp_scan(
     size_t n, typename Op::Data const *x, typename Op::Data *out, // Work dimensions
     typename Op::Data seed // Seed for thread 0
 ) {
@@ -168,13 +185,48 @@ __device__ void warp_scan(
             }
         }
     } else {
-        // Only output last accumulator to memory
+        // Handle warp tail
         if (thread_idx == 31) {
-            // Handle warp tail
             for (uint32_t i = end_i; i < end_i + (n - 32 * n_per_thread); ++i) {
                 accumulator = Op::combine(accumulator, x[i]);
             }
-            *out = accumulator;
+        }
+    }
+    return accumulator;
+}
+
+template <typename Op, uint32_t VEC_SIZE, bool DO_FIX>
+__device__ void warp_scan_handler(
+    size_t n, typename Op::Data const *x, typename Op::Data *out, // Work dimensions
+    typename Op::Data seed // Seed for thread 0
+) {
+    using Data = typename Op::Data;
+
+    // Divide x into blocks of 32 * VEC_SIZE and pass to warp scan
+    const uint32_t block_size = 32 * VEC_SIZE;
+    const uint32_t num_blocks = max((uint32_t)n / block_size, 1u);
+    const uint32_t thread_idx = threadIdx.x % 32;
+
+    for (uint32_t idx = 0; idx < num_blocks; ++idx) {
+        // Move buffers
+        Data const *bx = x + idx * block_size;
+        Data *bout = out + idx * block_size;
+
+        // On the last block process whatever is left
+        const uint32_t current_block_size = (idx == num_blocks - 1) ? n - idx * block_size : block_size;
+
+        // Call warp scan
+        seed = warp_scan<Op, VEC_SIZE, DO_FIX>(current_block_size, bx, bout, seed);
+        __syncwarp();
+
+        // For the next block, use the seed from the last thread of this block
+        seed = shfl_down_any(seed, 31 - threadIdx.x);
+    }
+
+    if constexpr (!DO_FIX) {
+        // Only output last accumulator to memory
+        if (thread_idx == 31) {
+            *out = seed;
         }
     }
 }
@@ -211,9 +263,9 @@ __global__ void local_scan(size_t n, typename Op::Data const *x, typename Op::Da
     if constexpr (DO_FIX) {
         // Each chunk gets the previous seed
         Data seed_val = (block_idx == 0 && warp_idx == 0) ? Op::identity() : *(warp_seed - 1);
-        warp_scan<Op, VEC_SIZE, true>(n_per_warp, warp_x, warp_out, seed_val);
+        warp_scan_handler<Op, VEC_SIZE, true>(n_per_warp, warp_x, warp_out, seed_val);
     } else {
-        warp_scan<Op, VEC_SIZE, false>(n_per_warp, warp_x, warp_seed, Op::identity());
+        warp_scan_handler<Op, VEC_SIZE, false>(n_per_warp, warp_x, warp_seed, Op::identity());
     }
 }
 template <typename Op, uint32_t VEC_SIZE>
@@ -285,28 +337,8 @@ typename Op::Data *launch_scan(
     constexpr uint32_t VS = 16 / sizeof(Data);
 
     // Memory
-    // ? * W * 2 * sizeof(Data); // Double buffer
-
-    // 3-Kernel parallel algorithm
-    // cudaFuncSetAttribute(
-    //     local_scan<Op, VS, false>,
-    //     cudaFuncAttributeMaxDynamicSharedMemorySize,
-    //     ?
-    // );
     local_scan<Op, VS, false><<<B, W*T>>>(n, x, x, seed);
-
-    // cudaFuncSetAttribute(
-    //     hierarchical_scan<Op, VS>,
-    //     cudaFuncAttributeMaxDynamicSharedMemorySize,
-    //     ?
-    // );
     hierarchical_scan<Op, VS><<<1, T>>>(B*W, seed, seed); // Use only 1 SM and 1 warp for the small hierarchical scan
-
-    // cudaFuncSetAttribute(
-    //     local_scan<Op, VS, true>,
-    //     cudaFuncAttributeMaxDynamicSharedMemorySize,
-    //     ?
-    // );
     local_scan<Op, VS, true><<<B, W*T>>>(n, x, x, seed);
 
     return x;
