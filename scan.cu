@@ -139,20 +139,13 @@ __device__ typename Op::Data thread_local_scan(size_t n, typename Op::Data const
 ) {
     using Data = typename Op::Data;
     using VecData = Vectorized<Data, VEC_SIZE>;
-    // Divide x across the threads
-    const uint32_t thread_idx = threadIdx.x % 32;
-    const uint32_t n_per_thread = ((n / VEC_SIZE) / 32) * VEC_SIZE; // Aligns to vector size
-    const uint32_t start_i = thread_idx * n_per_thread;
-    const uint32_t end_i = start_i + n_per_thread;
-    const uint32_t start_vi = start_i / VEC_SIZE;
-    const uint32_t end_vi = end_i / VEC_SIZE;
 
     // Vectorize
     VecData const *vx = reinterpret_cast<VecData const *>(x);
     VecData *vout = reinterpret_cast<VecData*>(out);
 
     // Local scan
-    for (uint32_t i = start_vi; i < end_vi; ++i) {
+    for (uint32_t i = 0; i < n / VEC_SIZE; ++i) {
         VecData v = vx[i];
         #pragma unroll
         for (uint32_t vi = 0; vi < VEC_SIZE; ++vi) {
@@ -163,8 +156,7 @@ __device__ typename Op::Data thread_local_scan(size_t n, typename Op::Data const
         if constexpr (DO_FIX) { vout[i] = v; }
     }
     // Handle vector tail
-    const uint32_t start_scalar_i = end_vi * VEC_SIZE;
-    for (uint32_t i = start_scalar_i; i < end_i; ++i) {
+    for (uint32_t i = (n / VEC_SIZE) * VEC_SIZE; i < n; ++i) {
         accumulator = Op::combine(accumulator, x[i]);
         if constexpr (DO_FIX) { out[i] = accumulator; }
     }
@@ -184,9 +176,12 @@ __device__ void warp_scan(
     const uint32_t start_i = thread_idx * n_per_thread;
     const uint32_t end_i = start_i + n_per_thread;
 
+    Data const *tx = x + thread_idx * n_per_thread;
+    Data *tout = out + thread_idx * n_per_thread;
+
     // Local scan
     Data accumulator = (thread_idx == 0) ? seed : Op::identity();
-    accumulator = thread_local_scan<Op, VEC_SIZE, false>(n, x, out, accumulator);
+    accumulator = thread_local_scan<Op, VEC_SIZE, false>(n_per_thread, tx, tout, accumulator);
     __syncwarp();
 
     // Hierarchical scan on endpoints
@@ -198,7 +193,7 @@ __device__ void warp_scan(
         accumulator = (thread_idx >= 1) ? accumulator : seed;
 
         // Local scan fix
-        accumulator = thread_local_scan<Op, VEC_SIZE, true>(n, x, out, accumulator);
+        accumulator = thread_local_scan<Op, VEC_SIZE, true>(n_per_thread, tx, tout, accumulator);
 
         // Handle warp tail
         if (thread_idx == 31) {
