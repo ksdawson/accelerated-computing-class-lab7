@@ -159,7 +159,7 @@ __device__ inline typename Op::Data thread_local_scan(size_t n, typename Op::Dat
     return accumulator;
 }
 
-template <typename Op, uint32_t VEC_SIZE, bool DO_FIX, uint32_t SMEM_SIZE>
+template <typename Op, uint32_t VEC_SIZE, bool DO_FIX>
 __device__ void warp_scan(
     size_t n, typename Op::Data const *x, typename Op::Data *out, // Work dimensions
     typename Op::Data seed // Seed for thread 0
@@ -174,7 +174,8 @@ __device__ void warp_scan(
 
     // Local scan
     Data accumulator = (thread_idx == 0) ? seed : Op::identity();
-    constexpr uint32_t SMEM_SIZE_ALIGNED = (SMEM_SIZE / VEC_SIZE) * VEC_SIZE;
+    const uint32_t SMEM_SIZE = n_per_thread / 1; // TODO use SMEM size
+    const uint32_t SMEM_SIZE_ALIGNED = (SMEM_SIZE / VEC_SIZE) * VEC_SIZE;
     const uint32_t STEP_SIZE = min(SMEM_SIZE_ALIGNED, n_per_thread);
     uint32_t processed = 0;
     while (processed < n_per_thread) {
@@ -224,7 +225,7 @@ __device__ void warp_scan(
 }
 
 // 3-Kernel Parallel Algorithm
-template <typename Op, uint32_t VEC_SIZE, bool DO_FIX, uint32_t SMEM_SIZE>
+template <typename Op, uint32_t VEC_SIZE, bool DO_FIX>
 __global__ void local_scan(size_t n, typename Op::Data const *x, typename Op::Data *out, typename Op::Data *seed) {
     using Data = typename Op::Data;
     // Thread block info
@@ -255,14 +256,14 @@ __global__ void local_scan(size_t n, typename Op::Data const *x, typename Op::Da
     if constexpr (DO_FIX) {
         // Each chunk gets the previous seed
         Data seed_val = (block_idx == 0 && warp_idx == 0) ? Op::identity() : *(warp_seed - 1);
-        warp_scan<Op, VEC_SIZE, true, SMEM_SIZE>(n_per_warp, warp_x, warp_out, seed_val);
+        warp_scan<Op, VEC_SIZE, true>(n_per_warp, warp_x, warp_out, seed_val);
     } else {
-        warp_scan<Op, VEC_SIZE, false, SMEM_SIZE>(n_per_warp, warp_x, warp_seed, Op::identity());
+        warp_scan<Op, VEC_SIZE, false>(n_per_warp, warp_x, warp_seed, Op::identity());
     }
 }
-template <typename Op, uint32_t VEC_SIZE, uint32_t SMEM_SIZE>
+template <typename Op, uint32_t VEC_SIZE>
 __global__ void hierarchical_scan(size_t n, typename Op::Data const *x, typename Op::Data *out) {
-    warp_scan<Op, VEC_SIZE, true, SMEM_SIZE>(n, x, out, Op::identity());
+    warp_scan<Op, VEC_SIZE, true>(n, x, out, Op::identity());
 }
 
 // Returns desired size of scratch buffer in bytes.
@@ -337,21 +338,21 @@ typename Op::Data *launch_scan(
     //     cudaFuncAttributeMaxDynamicSharedMemorySize,
     //     ?
     // );
-    local_scan<Op, VS, false, 2048><<<B, W*T>>>(n, x, x, seed);
+    local_scan<Op, VS, false><<<B, W*T>>>(n, x, x, seed);
 
     // cudaFuncSetAttribute(
     //     hierarchical_scan<Op, VS>,
     //     cudaFuncAttributeMaxDynamicSharedMemorySize,
     //     ?
     // );
-    hierarchical_scan<Op, VS, B*W><<<1, T>>>(B*W, seed, seed); // Use only 1 SM and 1 warp for the small hierarchical scan
+    hierarchical_scan<Op, VS><<<1, T>>>(B*W, seed, seed); // Use only 1 SM and 1 warp for the small hierarchical scan
 
     // cudaFuncSetAttribute(
     //     local_scan<Op, VS, true>,
     //     cudaFuncAttributeMaxDynamicSharedMemorySize,
     //     ?
     // );
-    local_scan<Op, VS, true, 2048><<<B, W*T>>>(n, x, x, seed);
+    local_scan<Op, VS, true><<<B, W*T>>>(n, x, x, seed);
 
     return x;
 }
