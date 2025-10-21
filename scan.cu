@@ -72,34 +72,6 @@ __device__ T shfl_up_any(T val, unsigned int delta) {
     return result;
 }
 
-// Memory loading helpers
-template <typename Op, uint32_t VEC_SIZE>
-__device__ void load_buffer(
-    typename Op::Data const *src, typename Op::Data *dst,
-    const uint32_t num_items
-) {
-    using Data = typename Op::Data;
-    using VecData = Vectorized<Data, VEC_SIZE>;
-    VecData const *vsrc = reinterpret_cast<VecData const *>(src);
-    VecData *vdst = reinterpret_cast<VecData*>(dst);
-    for (uint32_t idx = threadIdx.x; idx < num_items / VEC_SIZE; idx += blockDim.x) {
-        vdst[idx] = vsrc[idx];
-    }
-    __syncthreads();
-}
-template <typename Op, uint32_t VEC_SIZE>
-__device__ void load_buffer_async(
-    typename Op::Data const *src, typename Op::Data *dst,
-    const uint32_t num_items
-) {
-    using Data = typename Op::Data;
-    for (uint32_t idx = threadIdx.x; idx < num_items / VEC_SIZE; idx += blockDim.x) {
-        const uint32_t flat_idx = idx * VEC_SIZE;
-        __pipeline_memcpy_async(&dst[flat_idx], &src[flat_idx], sizeof(Data), 0);
-    }
-    __pipeline_commit();
-}
-
 namespace scan_gpu {
 
 // Helpers
@@ -174,17 +146,7 @@ __device__ void warp_scan(
 
     // Local scan
     Data accumulator = (thread_idx == 0) ? seed : Op::identity();
-    const uint32_t SMEM_SIZE = n_per_thread / 1; // TODO use SMEM size
-    const uint32_t SMEM_SIZE_ALIGNED = (SMEM_SIZE / VEC_SIZE) * VEC_SIZE;
-    const uint32_t STEP_SIZE = min(SMEM_SIZE_ALIGNED, n_per_thread);
-    uint32_t processed = 0;
-    while (processed < n_per_thread) {
-        const uint32_t chunk = min(STEP_SIZE, n_per_thread - processed);
-        const uint32_t local_start_i = start_i + processed;
-        const uint32_t local_end_i = local_start_i + chunk;
-        accumulator = thread_local_scan<Op, VEC_SIZE, false>(n, x, out, local_start_i, local_end_i, accumulator);
-        processed += chunk;
-    }
+    accumulator = thread_local_scan<Op, VEC_SIZE, false>(n, x, out, start_i, end_i, accumulator);
     __syncwarp();
 
     // Hierarchical scan on endpoints
@@ -196,14 +158,7 @@ __device__ void warp_scan(
         accumulator = (thread_idx >= 1) ? accumulator : seed;
 
         // Local scan fix
-        processed = 0;
-        while (processed < n_per_thread) {
-            const uint32_t chunk = min(STEP_SIZE, n_per_thread - processed);
-            const uint32_t local_start_i = start_i + processed;
-            const uint32_t local_end_i = local_start_i + chunk;
-            accumulator = thread_local_scan<Op, VEC_SIZE, true>(n, x, out, local_start_i, local_end_i, accumulator);
-            processed += chunk;
-        }
+        accumulator = thread_local_scan<Op, VEC_SIZE, true>(n, x, out, start_i, end_i, accumulator);
 
         // Handle warp tail
         if (thread_idx == 31) {
