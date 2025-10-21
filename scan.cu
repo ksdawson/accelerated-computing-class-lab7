@@ -109,9 +109,9 @@ __device__ void warp_scan(
 
     // Divide x across the threads
     const uint32_t thread_idx = threadIdx.x % 32;
-    const uint32_t n_per_thread = n / 32 + ((thread_idx < n % 32) ? 1 : 0);
+    const uint32_t n_per_thread = ((n / VEC_SIZE) / 32) * VEC_SIZE; // Aligns to vector size
     const uint32_t start_i = thread_idx * n_per_thread;
-    const uint32_t end_i = (thread_idx + 1) * n_per_thread;
+    const uint32_t end_i = start_i + n_per_thread;
     const uint32_t start_vi = start_i / VEC_SIZE;
     const uint32_t end_vi = end_i / VEC_SIZE;
 
@@ -128,6 +128,11 @@ __device__ void warp_scan(
             accumulator = Op::combine(accumulator, v.elements[vi]);
         }
     }
+    // Handle vector tail
+    const uint32_t start_scalar_i = end_vi * VEC_SIZE;
+    for (uint32_t i = start_scalar_i; i < end_i; ++i) {
+        accumulator = Op::combine(accumulator, x[i]);
+    }
     __syncwarp();
 
     // Hierarchical scan on endpoints
@@ -136,7 +141,7 @@ __device__ void warp_scan(
     if constexpr (DO_FIX) {
         // Shuffle accumulators
         accumulator = shfl_up_any(accumulator, 1);
-        accumulator = (thread_idx >= 1) ? accumulator : Op::identity();
+        accumulator = (thread_idx >= 1) ? accumulator : seed;
 
         // Local scan fix
         for (uint32_t i = start_vi; i < end_vi; ++i) {
@@ -149,17 +154,26 @@ __device__ void warp_scan(
             // Output to memory
             vout[i] = v;
         }
+        // Handle vector tail
+        for (uint32_t i = start_scalar_i; i < end_i; ++i) {
+            accumulator = Op::combine(accumulator, x[i]);
+            out[i] = accumulator;
+        }
 
-        // Handle tail
-        // if (thread_idx == 31) {
-        //     for (uint32_t i = end_i; i < end_i + n % 32; ++i) {
-        //         accumulator = Op::combine(accumulator, x[i]);
-        //         out[i] = accumulator;
-        //     }
-        // }
+        // Handle warp tail
+        if (thread_idx == 31) {
+            for (uint32_t i = end_i; i < end_i + (n - 32 * n_per_thread); ++i) {
+                accumulator = Op::combine(accumulator, x[i]);
+                out[i] = accumulator;
+            }
+        }
     } else {
         // Only output last accumulator to memory
         if (thread_idx == 31) {
+            // Handle warp tail
+            for (uint32_t i = end_i; i < end_i + (n - 32 * n_per_thread); ++i) {
+                accumulator = Op::combine(accumulator, x[i]);
+            }
             *out = accumulator;
         }
     }
@@ -176,16 +190,22 @@ __global__ void local_scan(size_t n, typename Op::Data const *x, typename Op::Da
     const uint32_t warp_idx = threadIdx.x / 32;
 
     // Divide x across the SMs
-    const uint32_t n_per_sm = n / num_sm + ((block_idx < n % num_sm) ? 1 : 0);
+    uint32_t n_per_sm = ((n / VEC_SIZE) / num_sm) * VEC_SIZE; // Aligns to vector size
     Data const *sm_x = x + block_idx * n_per_sm;
     Data *sm_out = out + block_idx * n_per_sm;
     Data *sm_seed = seed + block_idx * num_warp;
 
+    // Handle SM tail
+    n_per_sm += (block_idx == num_sm - 1) ? n - num_sm * n_per_sm : 0;
+
     // Divide sm_x across the warps
-    const uint32_t n_per_warp = n_per_sm / num_warp + ((warp_idx < n_per_sm % num_warp) ? 1 : 0);
+    uint32_t n_per_warp = ((n_per_sm / VEC_SIZE) / num_warp) * VEC_SIZE;
     Data const *warp_x = sm_x + warp_idx * n_per_warp;
     Data *warp_out = sm_out + warp_idx * n_per_warp;
     Data *warp_seed = sm_seed + warp_idx;
+
+    // Handle warp tail
+    n_per_warp += (warp_idx == num_warp - 1) ? n_per_sm - num_warp * n_per_warp : 0;
 
     // Call warp scan
     if constexpr (DO_FIX) {
