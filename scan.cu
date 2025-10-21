@@ -182,7 +182,17 @@ __device__ void warp_scan(
 
     // Local scan
     Data accumulator = (thread_idx == 0) ? seed : Op::identity();
-    accumulator = thread_local_scan<Op, VEC_SIZE, false>(n, x, out, start_i, end_i, accumulator);
+    const uint32_t SMEM_SIZE = n_per_thread / 1; // TODO use SMEM size
+    const uint32_t SMEM_SIZE_ALIGNED = (SMEM_SIZE / VEC_SIZE) * VEC_SIZE;
+    const uint32_t STEP_SIZE = min(SMEM_SIZE_ALIGNED, n_per_thread);
+    uint32_t processed = 0;
+    while (processed < n_per_thread) {
+        const uint32_t chunk = min(STEP_SIZE, n_per_thread - processed);
+        const uint32_t local_start_i = start_i + processed;
+        const uint32_t local_end_i = local_start_i + chunk;
+        accumulator = thread_local_scan<Op, VEC_SIZE, false>(n, x, out, local_start_i, local_end_i, accumulator);
+        processed += chunk;
+    }
     __syncwarp();
 
     // Hierarchical scan on endpoints
@@ -194,7 +204,14 @@ __device__ void warp_scan(
         accumulator = (thread_idx >= 1) ? accumulator : seed;
 
         // Local scan fix
-        accumulator = thread_local_scan<Op, VEC_SIZE, true>(n, x, out, start_i, end_i, accumulator);
+        processed = 0;
+        while (processed < n_per_thread) {
+            const uint32_t chunk = min(STEP_SIZE, n_per_thread - processed);
+            const uint32_t local_start_i = start_i + processed;
+            const uint32_t local_end_i = local_start_i + chunk;
+            accumulator = thread_local_scan<Op, VEC_SIZE, true>(n, x, out, local_start_i, local_end_i, accumulator);
+            processed += chunk;
+        }
 
         // Handle warp tail
         if (thread_idx == 31) {
