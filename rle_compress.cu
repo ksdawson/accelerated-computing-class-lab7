@@ -358,12 +358,78 @@ typename Op::Data *launch_scan(
 namespace rle_gpu {
 
 template <typename Op>
-__global__ void create_flag_array(size_t n, char const *raw, typename Op::Data *flag_arr) {
+__device__ void scalar_create_flag_array(size_t n, char const *raw, typename Op::Data *flag_arr) {
     if (blockIdx.x == 0 && threadIdx.x == 0) {
         flag_arr[0] = create_rle_data_4b(raw[0], 1);
     }
     for (uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x + 1; idx < n; idx += gridDim.x * blockDim.x) {
         flag_arr[idx] = create_rle_data_4b(raw[idx], (raw[idx] != raw[idx - 1]));
+    }
+}
+
+template <typename Op>
+__global__ void create_flag_array(size_t n, char const *raw, typename Op::Data *flag_arr) {
+    // If size is less than vector size use scalar version
+    if (n < 16) {
+        scalar_create_flag_array<Op>(n, raw, flag_arr);
+        return;
+    }
+
+    // Data types
+    using Data = typename Op::Data;
+    constexpr uint32_t CHAR_VEC_SIZE = 16;
+    constexpr uint32_t DATA_VEC_SIZE = 16 / sizeof(Data);
+    using VecData = Vectorized<Data, DATA_VEC_SIZE>;
+    using VecChar = Vectorized<char, CHAR_VEC_SIZE>;
+
+    // Vectorize
+    VecChar const *vraw = reinterpret_cast<VecChar const *>(raw);
+    VecData *vflag_arr = reinterpret_cast<VecData*>(flag_arr);
+
+    // Handle head
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        // Vector load chars
+        char prev = '\0';
+        VecChar vcurr = vraw[0];
+        // Iterate over data -> chars
+        #pragma unroll
+        for (uint32_t vd = 0; vd < DATA_VEC_SIZE; ++vd) {
+            VecData vdata;
+            const uint32_t vd_idx = vd * CHAR_VEC_SIZE / DATA_VEC_SIZE;
+            #pragma unroll
+            for (uint32_t vc = 0; vc < CHAR_VEC_SIZE / DATA_VEC_SIZE; ++vc) {
+                char curr = vcurr.elements[vd_idx + vc];
+                vdata.elements[vc] = create_rle_data_4b(curr, (prev != curr));
+                prev = curr;
+            }
+            vflag_arr[vd] = vdata;
+        }
+    }
+
+    // Handle body
+    for (uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x + 1; idx < n / CHAR_VEC_SIZE; idx += gridDim.x * blockDim.x) {
+        char prev = raw[idx * CHAR_VEC_SIZE - 1];
+        VecChar vcurr = vraw[idx];
+        #pragma unroll
+        for (uint32_t vd = 0; vd < DATA_VEC_SIZE; ++vd) {
+            VecData vdata;
+            const uint32_t vd_idx = vd * CHAR_VEC_SIZE / DATA_VEC_SIZE;
+            #pragma unroll
+            for (uint32_t vc = 0; vc < CHAR_VEC_SIZE / DATA_VEC_SIZE; ++vc) {
+                char curr = vcurr.elements[vd_idx + vc];
+                vdata.elements[vc] = create_rle_data_4b(curr, (prev != curr));
+                prev = curr;
+            }
+            vflag_arr[idx * CHAR_VEC_SIZE / DATA_VEC_SIZE + vd] = vdata;
+        }
+    }
+
+    // Handle tail
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        const uint32_t start_scalar_idx = (n / CHAR_VEC_SIZE) * CHAR_VEC_SIZE;
+        for (uint32_t idx = start_scalar_idx; idx < n; ++idx) {
+            flag_arr[idx] = create_rle_data_4b(raw[idx], (raw[idx] != raw[idx - 1]));
+        }
     }
 }
 
