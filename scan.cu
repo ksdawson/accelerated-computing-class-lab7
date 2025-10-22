@@ -99,6 +99,7 @@ __device__ typename Op::Data warp_local_scan(typename Op::Data val) {
     // Computes parallel prefix on 32 elements using Hillis Steele Scan w/ warp shuffle
     const uint32_t thread_idx = threadIdx.x % 32;
     uint32_t idx = 1;
+    #pragma unroll
     for (uint32_t step = 0; step < 5; ++step) { // log2(32) = 5
         // Load prefix from register
         Data tmp = shfl_up_any(val, idx);
