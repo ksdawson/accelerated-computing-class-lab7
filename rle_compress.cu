@@ -448,7 +448,7 @@ uint32_t launch_rle_compress(
     RleData2 *cd_out = reinterpret_cast<RleData2*>((flag + (16778294)));
 
     // Create flag array
-    create_flag_array<SumOp><<<48, 8*32>>>(raw_count, raw, flag);
+    create_flag_array<SumOp><<<48, 32*32>>>(raw_count, raw, flag);
 
     // Run scan of raw
     scan_gpu::launch_scan<SumOp>(raw_count, flag, seed);
