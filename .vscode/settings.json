@@ -1,0 +1,7 @@
+{
+    "files.associations": {
+        ".ms": "BluespecSystemVerilog",
+        "*.ms": "BluespecSystemVerilog",
+        "chrono": "cpp"
+    }
+}
