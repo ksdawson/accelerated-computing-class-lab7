@@ -51,32 +51,32 @@ void rle_compress_cpu(
 
 /// <--- your code here --->
 
-struct __align__(4) RleData {
+struct __align__(4) RleData4B {
     char val;
     uint32_t count : 24;
 };
-static_assert(sizeof(RleData) == 4, "RleData must be 4 bytes");
-struct __align__(8) RleData2 {
+static_assert(sizeof(RleData4B) == 4, "RleData4B must be 4 bytes");
+struct __align__(8) RleData8B {
     uint32_t count;
     char val;
 };
-static_assert(sizeof(RleData2) == 8, "RleData2 must be 8 bytes");
+static_assert(sizeof(RleData8B) == 8, "RleData8B must be 8 bytes");
 
-__device__ RleData create_rle_data(char val, uint32_t count) {
-    RleData data;
+__device__ RleData4B create_rle_data_4b(char val, uint32_t count) {
+    RleData4B data;
     data.val = val;
     data.count = count;
     return data;
 }
-__device__ RleData2 create_rle_data2(char val, uint32_t count) {
-    RleData2 data;
+__device__ RleData8B create_rle_data_8b(char val, uint32_t count) {
+    RleData8B data;
     data.val = val;
     data.count = count;
     return data;
 }
 
 struct SumOp {
-    using Data = RleData;
+    using Data = RleData4B;
 
     static __host__ __device__ __forceinline__ Data identity() {
         Data data;
@@ -360,42 +360,42 @@ namespace rle_gpu {
 template <typename Op>
 __global__ void create_flag_array(size_t n, char const *raw, typename Op::Data *flag_arr) {
     if (blockIdx.x == 0 && threadIdx.x == 0) {
-        flag_arr[0] = create_rle_data(raw[0], 1);
+        flag_arr[0] = create_rle_data_4b(raw[0], 1);
     }
     for (uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x + 1; idx < n; idx += gridDim.x * blockDim.x) {
-        flag_arr[idx] = create_rle_data(raw[idx], (raw[idx] != raw[idx - 1]));
+        flag_arr[idx] = create_rle_data_4b(raw[idx], (raw[idx] != raw[idx - 1]));
     }
 }
 
 template <typename Op>
-__global__ void extract_data(size_t n, typename Op::Data *flag_arr, RleData2 *out) {
+__global__ void extract_data(size_t n, typename Op::Data *flag_arr, RleData8B *out) {
     using Data = typename Op::Data;
     if (blockIdx.x == 0 && threadIdx.x == 0) {
-        Data item = flag_arr[0];
-        out[0] = create_rle_data2(item.val, 0);
+        const Data item = flag_arr[0];
+        out[0] = create_rle_data_8b(item.val, 0);
     }
     for (uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x + 1; idx < n; idx += gridDim.x * blockDim.x) {
-        Data prev = flag_arr[idx - 1];
-        Data curr = flag_arr[idx];
+        const Data prev = flag_arr[idx - 1];
+        const Data curr = flag_arr[idx];
         if (prev.count != curr.count) {
-            out[curr.count - 1] = create_rle_data2(curr.val, idx);
+            out[curr.count - 1] = create_rle_data_8b(curr.val, idx);
         }
     }
 }
 
 __global__ void extract_compressed_data(
     uint32_t raw_count,
-    uint32_t n, RleData2 *cd_out,
+    uint32_t n, RleData8B *cd_out,
     char *compressed_data, uint32_t *compressed_lengths
 ) {
     for (uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < n - 1; idx += gridDim.x * blockDim.x) {
-        RleData2 curr = cd_out[idx];
-        RleData2 next = cd_out[idx + 1];
+        const RleData8B curr = cd_out[idx];
+        const RleData8B next = cd_out[idx + 1];
         compressed_data[idx] = curr.val;
         compressed_lengths[idx] = next.count - curr.count;
     }
     if (blockIdx.x == 0 && threadIdx.x == 0) {
-        RleData2 curr = cd_out[n - 1];
+        const RleData8B curr = cd_out[n - 1];
         compressed_data[n - 1] = curr.val;
         compressed_lengths[n - 1] = raw_count - curr.count;
     }
@@ -406,7 +406,7 @@ size_t get_workspace_size(uint32_t raw_count) {
     using Data = typename SumOp::Data;
     const size_t scan_size = 48 * 8 * sizeof(Data);
     const size_t flag_arr_size = (16778294) * sizeof(Data);
-    const size_t compressed_data_size = (16778294) * sizeof(RleData2);
+    const size_t compressed_data_size = (16778294) * sizeof(RleData8B);
     return scan_size + flag_arr_size + compressed_data_size;
 }
 
@@ -445,7 +445,7 @@ uint32_t launch_rle_compress(
     // Partition the workspace
     void *seed = workspace;
     Data *flag = reinterpret_cast<Data*>(seed) + 48 * 8;
-    RleData2 *cd_out = reinterpret_cast<RleData2*>((flag + (16778294)));
+    RleData8B *cd_out = reinterpret_cast<RleData8B*>((flag + (16778294)));
 
     // Create flag array
     create_flag_array<SumOp><<<48, 32*32>>>(raw_count, raw, flag);
@@ -454,7 +454,7 @@ uint32_t launch_rle_compress(
     scan_gpu::launch_scan<SumOp>(raw_count, flag, seed);
 
     // Launch a kernel to extract the data
-    extract_data<SumOp><<<48, 16*32>>>(raw_count, flag, cd_out);
+    extract_data<SumOp><<<48, 32*32>>>(raw_count, flag, cd_out);
 
     // Extract the compressed count
     Data last_run;
@@ -462,7 +462,7 @@ uint32_t launch_rle_compress(
     uint32_t compressed_count = last_run.count;
 
     // Launch a kernel to extract the compressed data and lengths
-    extract_compressed_data<<<48, 8*32>>>(raw_count, compressed_count, cd_out, compressed_data, compressed_lengths);
+    extract_compressed_data<<<48, 32*32>>>(raw_count, compressed_count, cd_out, compressed_data, compressed_lengths);
 
     return compressed_count;
 }
