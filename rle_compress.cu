@@ -454,7 +454,7 @@ uint32_t launch_rle_compress(
     scan_gpu::launch_scan<SumOp>(raw_count, flag, seed);
 
     // Launch a kernel to extract the data
-    extract_data<SumOp><<<48, 8*32>>>(raw_count, flag, cd_out);
+    extract_data<SumOp><<<48, 16*32>>>(raw_count, flag, cd_out);
 
     // Extract the compressed count
     Data last_run;
