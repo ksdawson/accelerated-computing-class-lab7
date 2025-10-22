@@ -78,7 +78,12 @@ __device__ RleData2 create_rle_data2(char val, uint32_t count) {
 struct SumOp {
     using Data = RleData;
 
-    static __host__ __device__ __forceinline__ Data identity() { return {'\0', 0}; }
+    static __host__ __device__ __forceinline__ Data identity() {
+        Data data;
+        data.val = '\0';
+        data.count = 0;
+        return data;
+    }
 
     static __host__ __device__ __forceinline__ Data combine(Data a, Data b) {
         b.count += a.count;
@@ -364,7 +369,7 @@ __global__ void create_flag_array(size_t n, char const *raw, typename Op::Data *
 
 template <typename Op>
 __global__ void extract_data(size_t n, typename Op::Data *flag_arr, RleData2 *out) {
-    using Data = typename SumOp::Data;
+    using Data = typename Op::Data;
     if (blockIdx.x == 0 && threadIdx.x == 0) {
         Data item = flag_arr[0];
         out[0] = create_rle_data2(item.val, 0);
@@ -372,7 +377,7 @@ __global__ void extract_data(size_t n, typename Op::Data *flag_arr, RleData2 *ou
     for (uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x + 1; idx < n; idx += gridDim.x * blockDim.x) {
         Data prev = flag_arr[idx - 1];
         Data curr = flag_arr[idx];
-        if (prev.val != curr.val) {
+        if (prev.count != curr.count) {
             out[curr.count - 1] = create_rle_data2(curr.val, idx);
         }
     }
@@ -400,8 +405,8 @@ __global__ void extract_compressed_data(
 size_t get_workspace_size(uint32_t raw_count) {
     using Data = typename SumOp::Data;
     const size_t scan_size = 48 * 8 * sizeof(Data);
-    const size_t flag_arr_size = (16 << 20) * sizeof(Data);
-    const size_t compressed_data_size = (16 << 20) * sizeof(RleData2);
+    const size_t flag_arr_size = (16778294) * sizeof(Data);
+    const size_t compressed_data_size = (16778294) * sizeof(RleData2);
     return scan_size + flag_arr_size + compressed_data_size;
 }
 
@@ -440,7 +445,7 @@ uint32_t launch_rle_compress(
     // Partition the workspace
     void *seed = workspace;
     Data *flag = reinterpret_cast<Data*>(seed) + 48 * 8;
-    RleData2 *cd_out = reinterpret_cast<RleData2*>((flag + (16 << 20)));
+    RleData2 *cd_out = reinterpret_cast<RleData2*>((flag + (16778294)));
 
     // Create flag array
     create_flag_array<SumOp><<<48, 8*32>>>(raw_count, raw, flag);
