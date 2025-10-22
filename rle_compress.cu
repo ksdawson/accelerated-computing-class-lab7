@@ -333,7 +333,7 @@ typename Op::Data *launch_scan(
 
     // Thread block dimensions
     constexpr uint32_t B = 48;
-    constexpr uint32_t W = 8; // Tuning parameter
+    constexpr uint32_t W = 32; // Tuning parameter
     constexpr uint32_t T = 32;
 
     // Set vector size
@@ -470,7 +470,7 @@ __global__ void extract_compressed_data(
 // Returns desired size of scratch buffer in bytes.
 size_t get_workspace_size(uint32_t raw_count) {
     using Data = typename SumOp::Data;
-    const size_t scan_size = 48 * 8 * sizeof(Data);
+    const size_t scan_size = 48 * 32 * sizeof(Data);
     const size_t flag_arr_size = (16778294) * sizeof(Data);
     const size_t compressed_data_size = (16778294) * sizeof(RleData8B);
     return scan_size + flag_arr_size + compressed_data_size;
@@ -510,7 +510,7 @@ uint32_t launch_rle_compress(
 
     // Partition the workspace
     void *seed = workspace;
-    Data *flag = reinterpret_cast<Data*>(seed) + 48 * 8;
+    Data *flag = reinterpret_cast<Data*>(seed) + 48 * 32;
     RleData8B *cd_out = reinterpret_cast<RleData8B*>((flag + (16778294)));
 
     // Create flag array
